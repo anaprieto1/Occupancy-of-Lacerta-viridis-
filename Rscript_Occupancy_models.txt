@@ -1,0 +1,337 @@
+library(usdm)
+library(unmarked)
+library(fmsb)             ##NagelkerkeR2
+library(PresenceAbsence)
+library(AICcmodavg)
+library(MuMIn)
+library(ncf)
+library(ape)
+library(spdep)
+library(ngspatial)
+library(GISTools)
+library(snow)
+library(igraph)             #convert data.frame to adj.matrix
+library(parallel)
+library(ROCR)               # roc and auc
+library(CARBayes)
+library(hier.part)          #variance partitioning
+library(vegan)
+library(perfomance) 
+
+
+
+###Global model and SpatialAutoCorrelation SAC###
+
+y<-read.csv("y_matrix.csv", header=T)
+attach(y)
+y
+
+obs<-read.csv("obsCovs.csv", header=T)
+attach(obs)
+obs
+
+unkm<-read.csv("unkm.csv", header=T)
+
+data_occ<-unmarkedFrameOccu(y=y,siteCovs=tres, obsCovs=obs)
+summary(data_occ)
+
+model_occ<-occu(~day+Patch_hq_VSI+Area~Area+Perimeter+Shape_index+Isolation+Near_river+Patch_hq_VSI+Radiation+ Urban+Habitat, data_occ)
+
+y <- getY(model_occ)
+e <- fitted(ms_all, na.rm = FALSE)
+r<- y - e 
+summary(r)
+resid<-r[, 1]
+
+#Get centroids
+
+patches<-resdShapePoly("Patches.shp", proj4string=CRS("+proj=longlat +datum=WGS84"))
+centroids<-gCentroid(patches, byid=TRUE)
+coords<-as.data.frame(coordinates(centroids))
+lat<-coords[,2]
+lon<-coords[,1]
+coor<-cbind(lat, lon)
+dat<-cbind(coor, resid)
+
+
+#Visualize network depending on centroids distances
+
+dnn<-dnearneigh(coor,0, 1, longlat=TRUE)   ##max.dist=500m
+summary(dnn, coor)
+plot(dnn, coor, col="blue")
+
+
+#Correlogram
+
+cor<-correlog(x=dat$lon, y=dat$lat, z=dat$resid, increment=0.2, resamp=1000, latlon=T)
+plot(cor)
+corr<-spline.correlog(x=dat$lon, y=dat$lat, z=dat$s1,  resamp=1000, latlon=T)
+plot(corr)
+
+# extract values for lags
+lag<-(cor$mean.of.class)  ## mean distance of each lag
+p<-(cor$p)                 ## p-value Moran's I
+correl<-(cor$correlation)  ##correlations
+pairs<-(cor$n)
+correlog<-data.frame(lag, pairs, p, correl)
+correlog.sub<-subset(correlog, correlog$p<0.05)
+correlog.sub1<-subset(correlog.sub, correlog.sub$correl>0)
+correlog.sub1
+
+#Moran I
+
+coor<-as.matrix(coor)
+dis<-spDists(coor, longlat=T)
+d.inv<-1/dis
+diag(d.inv)<-0
+moran<-Moran.I(resid, d.inv)
+moran
+
+
+###Generate Autocovariate###
+
+
+##Trial Autologistic model
+
+
+#Adj. matrix from real patch to patch distances calculated in ArcMap with igraph to run autologistic model in order to
+test SAC in this model's residuals
+
+Adj.list<-read.csv("Adj_500.csv", header=T)
+attach(Adj.list)
+summary(Adj.list)
+g<-graph_from_data_frame(Adj.list)
+A_500<-as_adjacency_matrix(g, attr="Dist", sparse=FALSE)
+A_500
+
+#Adj. matrix from patches centroids with sped: 
+
+knn<-knearneigh(coor, k=6)
+knn1<-knn2nb(knn)
+plot(knn1, coor)
+adj.matrix<-nb2mat(knn1, glist=NULL, style="W") 
+
+autolog<-read.csv("MS_autolog.csv", header=T)
+attach(autolog)
+summary(autolog)
+
+ms_autolog<-autologistic(Occupancy~Area+Perimeter+Shape_index+Isolation+Near_Crop+Near_Urban+Near_river+Patch_hq_VSI
++Radiation+crop+urban+wood+shrub, A=A, method="Bayes", control=list(trainit=10, minit=100, sigma=10), autolog )
+
++++Matrix 150m. 
+ms_autolog<-autologistic(Occupancy~Area+Perimeter+Shape_index+Isolation+Near_Crop+Near_Urban+Near_river+Patch_hq_VSI
++Radiation+crop+urban+wood+shrub+rubb+rock+soil, A=A_150, method="PL", control=list(bootit=100, nodes=6), autolog )
+
++++Matrix 500m
+ms_autolog<-autologistic(Occupancy~Area+Perimeter+Shape_index+Isolation+Near_Crop+Near_Urban+Patch_hq_VSI
++Radiation+crop+urban+wood+shrub+rubb+rock+grst+soil, A=A_500, method="PL", control=list(bootit=10, nodes=6), autolog )
+
++++Matrix 1km. 
+ms_autolog<-autologistic(Occupancy~Area+Perimeter+Shape_index+Isolation+Near_Crop+Near_Urban+Patch_hq_VSI
++Radiation+crop+urban+wood+shrub+rubb+rock++grst+soil, A=A_1000, method="PL", control=list(bootit=10, nodes=6), autolog)
+
+
+#Get Autocov with spdep
+
+
+ac1<-autocov_dist(autolog$Occupancy, coor, nbs=6500, type="inverse")
+ac2<-autocov_dist(autolog$Occupancy, coor, nbs=5000, type="inverse")
+ac3<-autocov_dist(autolog$Occupancy, coor, nbs=4000, type="inverse")
+
+
+autcov<-autocov_dist(autolog$Occupancy, coor, nbs=50, type="inverse", zero.policy=TRUE, longlat=TRUE)
+autcov1<-autocov_dist(autolog$Occupancy, coor, nbs=10, type="inverse", zero.policy=TRUE, longlat=TRUE)
+autcov2<-autocov_dist(autolog$Occupancy, coor, nbs=5, type="inverse", zero.policy=TRUE, longlat=TRUE)
+
+#Test correction of SAC
+
+-> In model with A_150
+
+ms_autolog<-autologistic(Occupancy~Area+Perimeter+Shape_index+Isolation+Near_Crop+Near_Urban+Near_river+Patch_hq_VSI
++Radiation+crop+urban+wood+shrub+rubb+rock+soil+ac1, A=A_150, method="PL", control=list(bootit=100, nodes=6), autolog )
+
+
+
+## Trial with PCNM's (!!!)
+
+Occupancy<-read.csv(Occupancy.csv", header=T)
+dis<-spDists(coor, longlat=T)
+pcnm<-pcnm(dis,threshold=1,  dist.ret=T)	
+pc<-as.data.frame(pcnm$vectors)			# Already separates positive ones
+pc<-cbind(Occupancy, pc)	
+
+--> stepAIC
+		
+pc_autolog.null<-glm(Occupancy~1,binomial,pc)
+pc_autolog<-glm(Occupancy~., binomial,pc)
+stepAIC(pc_autolog.null, scope=formula(pc_autolog), direction="forward", trace=TRUE, AICc=TRUE)
+			
+
+#Test SAC correction in 'occu' model
+#selected autocov pc's: 8, 14
+
+
+site<-cbind(site, autcov8, autcov14)
+
+data_occ1<-unmarkedFrameOccu(y=y,siteCovs=site, obsCovs=obs)
+summary(model_occ1)
+
+model_occ1<-occu(~day+Patch_hq_VSI~Area+Perimeter+Shape_index+Isolation+Near_river+Patch_hq_VSI+Radiation+ Urban+Habitat+autcov8+autcov14, data_occ1)
+
+
+
+###Models selection and averaging### 
+
+
+d<-dredge(ms_all, rank="AICc")
+
+sub<-subset(model.sel(d,rank=AICc), delta<2) # shows the table with the models summarized
+sub                                          
+write.csv(sub, "subs.csv")
+
+subs<-get.models(d, subset=delta<2) 
+subs
+mav<-model.avg(subs)
+summary(mav)   # get estimantes
+mav.conf<-confint(mav)    # get confident intervals
+write.csv(mav.conf, "conf.int.PL.csv")
+
+imp<-importance(sub)
+plot(imp)
+
+
+sub.subs<-get.models(subs, subset=c('12333', '8493', '8237', '12589', '12585', '28733','10345'))  #subs from model.sel list (subs) to remove model that didn't fit
+fit.list<-fitList(fits=sub.subs)   #converts selected models list (MuMIn) in a unmarked.list
+
+
+##NagelkerkeR2
+
+null<-occu(~1~1, data_occ1)
+list2<-list(Null=null, m1)
+list3<-fitList(fits=list2)
+nag<-modSel(list3, nullmod="Null")
+nag
+
+# Kappa, AUC, TSS
+
+thresh.vector<-seq(0,1, by=0.01)
+
+psi<-predict(m1, type="state")
+pred<-psi[,1]
+conf.matrix<-cinc[,1:2]
+conf.matrix<-cbind(conf.matrix, pred)
+thresh<-optimal.thresholds(conf.matrix, threshold=thresh.vector, opt.methods=c( "MaxSens+Spec", "MaxKappa"))    #The first is TSS
+thresh
+
+accuracy<-presence.absence.accuracy(conf.matrix, threshold=0.5, find.auc=TRUE)
+accuracy
+
+
+###Graphs###
+
+##Predicted Detection probabilities
+
+plotDet<-data.frame(HQ=seq(from=0.3, to=1.5, length=100), day=mean(obs$day), Area=mean(cinc$Area))
+psi.Det<-predict(fit.list,plotDet, type="det")
+
+det<-occu(~HQ~1, cinc_occ)
+plotDet<-data.frame(HQ=seq(from=0.3, to=1.5, length=100))
+psi.Det<-predict(det,plotDet, type="det")                            ##if is the model with one variable
+
+plot(plotDet$HQ, psi.Det$Predicted, type="l",lwd =2, ylim=0:1,
+   xlab="Vegetation structure", ylab="Detection probability")
+   lines(plotDet$HQ, psi.Det$Predicted-1.96*psi.Det$SE, lty=2)
+   lines(plotDet$HQ, psi.Det$Predicted+1.96*psi.Det$SE, lty=2)
+
+##Predicted Occupancy probabilities
+
+
+plotHab8 = data.frame(Densewood = seq(from=0, to=1, length=100),Area=mean(tres$Area),Isolation=mean(tres$Isolation),
+Perimeter=mean(tres$Perimeter), Slope=mean(tres$Slope), prox_3km=mean(tres$prox_3km))
+
+
+psi.Hab8<-predict(m8,plotHab8, type="state")
+
+lines(plotHab$Densewood, psi.Hab$Predicted, type="l",lwd =3, ylim=0:1,col="blue",
+   xlab="Proportion of dense woodland", ylab="Occupancy probability")
+   lines(plotHab$Densewood, psi.Hab$Predicted-1.96*psi.Hab$SE, lty=2)
+   lines(plotHab$Densewood, psi.Hab$Predicted+1.96*psi.Hab$SE, lty=2)	
+
+
+lines(plotHab1$Densewood, psi.Hab1$Predicted, type="l",lwd =3, ylim=0:1,col="blue",
+   xlab="Proportion of dense woodland", ylab="Occupancy probability")
+   lines(plotHab1$Densewood, psi.Hab1$Predicted-1.96*psi.Hab$SE, lty=2)
+   lines(plotHab1$Densewood, psi.Hab1$Predicted+1.96*psi.Hab$SE, lty=2)	
+   
+   
+   
+##Graph scale of effect
+
+se_pr<-read.csv("scale_effect.Pr.csv", header=T)
+summary(se_pr)
+
+se_pr1<-read.csv("scale_effect.Pr1.csv", header=T)
+summary(se_pr1)
+
+se_pl<-read.csv("scale_effect_Pl.csv", header=T)
+summary(se_pl)
+
+ggplot(se_pr, aes(x = Scale, y = RN², group=Cover)) +  geom_point(aes(color=Cover), size=2.2) + geom_line(aes(color=Cover), size=1.0)+
+scale_x_continuous(breaks=c(250, 500, 750, 1000, 1500, 2000, 2500, 3000))+ 
+scale_y_continuous(breaks=c(0.2, 0.3, 0.4, 0.5, 0.6), limits=c(0.1, 0.6))+
+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"), legend.position="none",
+axis.title=element_text(size=12), axis.text.x=element_text(size=13), axis.text.y=element_text(size=13))+
+scale_color_manual(values=c("Habitat"="green4", "Crop_pas"="darkorange", "Urban"="gray40", "Prox"="dodgerblue1"))+
+xlab("Scale") +ylab("Nagelkerke R²")
+   
+
+## For categorical variables
+   
+plot.data = data.frame(Grazing = 1, Ecotone=0, Competitor=0, pi6=mean(ms$pi6))  ###for categorical this method gives just one value--off course
+psi<-predict(fit.list,plot.data, type="state")
+   
+  
+newdata = data.frame(Grazing = c(1, 0), Ecotone=0, Competitor=0, pi6=mean(ms$pi6))
+mov<-modavgEffect(subs, Modnames=NULL, newdata = newdata, parm.type = "psi", type = "link")
+
+
+  
+Grazing<-as.data.frame(ms$Grazing)
+psi<-predict(fit.list, newdata,  type="state")  
+
+ 
+psi<-predict(fit.list, type="state")                                         
+ggplot(plot, aes(Grazing, Predicted , fill=Grazing))+ geom_boxplot(width=0.4)+scale_fill_brewer(palette="Set2") +
+labs(x="Grazing", y="Occupancy probability") 
+
+ggplot(plot, aes(Grazing, Predicted , fill=Grazing))+ geom_boxplot(width=0.4)+scale_fill_grey(start=0.8, end=0.6) +
+labs(x="Grazing", y="Occupancy probability") 
+
+
+#Variables influecing grazing
+
+#Variance partitioning between variables affecting grazing at each scale
+
+gr<-c(0,0,0,1,1,1,0,1,0,0,1,1,1,1,1,0,0,1,0,0,0,0,1,1,1,1,0,0,1,1,1,1,0,1,1,1,1,1,1,0,0,0)
+
+
+m<-glm(Grazing~Shrubland+ Grassland+ Woodland+ Grass_sparse_trees+ Rocky_veg+ Rubber+ Bare_soil+Cropland, binomial, cinc)           # then remove the negative ones
+summary(m)
+data<-subset(quin, select=c(Shrubland, Grassland, Woodland, Grass_sparse_trees, Rocky_veg, Rubber, Bare_soil, Cropland ))
+hier.part(gr, data, family="binomial", gof="logLik", barplot=TRUE)
+
+
+#graph of all partitionings in all scales
+
+
+data<-read.csv("plot.grazing1.csv", header=T)
+
+ggplot(data, aes(Scale, Effect_size, fill=Cover_type))+ geom_bar(stat="identity")+ coord_flip()+
+scale_fill_manual(values=("Woodland="green", "Shrubland"="red", "Rubber"="pink", "Grassland"="purple", "Bare_soil"="brown", 
+"Grass_trees"="yellow", "Rocky_veg"="dark_green", "Crop"="orange")
+
+
+
+
+
